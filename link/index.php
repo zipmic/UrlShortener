@@ -1,9 +1,52 @@
 <?php
 declare(strict_types=1);
 
-define('DB_PATH', __DIR__ . '/data/urls.db');
-define('BASE_URL', 'https://www.code.dk/link/');
-define('CODE_LENGTH', 6);
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+// To store the DB outside the web root (strongly recommended on production),
+// change this to an absolute path above your public_html / www directory.
+// Example for typical shared hosting:
+//   define('DB_PATH', dirname(__DIR__, 2) . '/urlshortener_data/urls.db');
+define('DB_PATH',            __DIR__ . '/data/urls.db');
+define('BASE_URL',           'https://www.code.dk/link/');
+define('CODE_LEN',           6);
+define('MAX_URL_LEN',        2048);
+define('RATE_LIMIT_MAX',     10);   // max submissions per IP per window
+define('RATE_LIMIT_WINDOW',  60);   // seconds
+
+const BLOCKED_DOMAINS = [
+    'localhost',
+    // extend with known phishing / malware domains as needed
+];
+
+// ---------------------------------------------------------------------------
+// Security headers
+// ---------------------------------------------------------------------------
+
+header('X-Content-Type-Options: nosniff');
+header('X-Frame-Options: DENY');
+header('Referrer-Policy: no-referrer');
+header("Content-Security-Policy: default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'");
+
+// ---------------------------------------------------------------------------
+// Session + CSRF
+// ---------------------------------------------------------------------------
+
+session_start();
+
+function getCsrfToken(): string {
+    if (empty($_SESSION['csrf_token'])) {
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    }
+    return $_SESSION['csrf_token'];
+}
+
+function verifyCsrf(string $token): bool {
+    return !empty($_SESSION['csrf_token'])
+        && hash_equals($_SESSION['csrf_token'], $token);
+}
 
 // ---------------------------------------------------------------------------
 // Database
@@ -11,39 +54,110 @@ define('CODE_LENGTH', 6);
 
 function getDb(): PDO {
     $dir = dirname(DB_PATH);
-    if (!is_dir($dir)) {
-        mkdir($dir, 0750, true);
+    if (!is_dir($dir) && !mkdir($dir, 0750, true) && !is_dir($dir)) {
+        throw new RuntimeException('Cannot create data directory: ' . $dir);
     }
+
     $db = new PDO('sqlite:' . DB_PATH);
     $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+
+    // WAL mode reduces write-lock contention under concurrent traffic
+    $db->exec("PRAGMA journal_mode=WAL");
+
     $db->exec("CREATE TABLE IF NOT EXISTS urls (
         code    TEXT PRIMARY KEY,
         url     TEXT NOT NULL,
         created INTEGER NOT NULL
     )");
+
+    $db->exec("CREATE TABLE IF NOT EXISTS rate_limits (
+        ip  TEXT    NOT NULL,
+        ts  INTEGER NOT NULL
+    )");
+
+    $db->exec("CREATE INDEX IF NOT EXISTS idx_rate ON rate_limits (ip, ts)");
+
     return $db;
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Rate limiting
+// ---------------------------------------------------------------------------
+
+function checkRateLimit(PDO $db, string $ip): bool {
+    $since = time() - RATE_LIMIT_WINDOW;
+
+    // Prune expired entries to keep the table small
+    $db->prepare('DELETE FROM rate_limits WHERE ts < ?')->execute([$since]);
+
+    $stmt = $db->prepare('SELECT COUNT(*) FROM rate_limits WHERE ip = ? AND ts >= ?');
+    $stmt->execute([$ip, $since]);
+    return (int) $stmt->fetchColumn() < RATE_LIMIT_MAX;
+}
+
+function recordRequest(PDO $db, string $ip): void {
+    $db->prepare('INSERT INTO rate_limits (ip, ts) VALUES (?, ?)')->execute([$ip, time()]);
+}
+
+// ---------------------------------------------------------------------------
+// URL validation
+// ---------------------------------------------------------------------------
+
+function isValidUrl(string $url): bool {
+    if (strlen($url) > MAX_URL_LEN) {
+        return false;
+    }
+
+    if (!preg_match('/^https?:\/\//i', $url)) {
+        return false;
+    }
+
+    if (filter_var($url, FILTER_VALIDATE_URL) === false) {
+        return false;
+    }
+
+    $host = strtolower((string) parse_url($url, PHP_URL_HOST));
+    if ($host === '') {
+        return false;
+    }
+
+    // Block explicitly listed domains
+    foreach (BLOCKED_DOMAINS as $blocked) {
+        if ($host === $blocked || str_ends_with($host, '.' . $blocked)) {
+            return false;
+        }
+    }
+
+    // Block private / loopback / reserved IP addresses
+    if (filter_var($host, FILTER_VALIDATE_IP) !== false) {
+        $isPublic = filter_var(
+            $host,
+            FILTER_VALIDATE_IP,
+            FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE
+        );
+        if ($isPublic === false) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// URL storage helpers
 // ---------------------------------------------------------------------------
 
 function generateCode(PDO $db): string {
     $chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
     do {
         $code = '';
-        for ($i = 0; $i < CODE_LENGTH; $i++) {
+        for ($i = 0; $i < CODE_LEN; $i++) {
             $code .= $chars[random_int(0, strlen($chars) - 1)];
         }
         $stmt = $db->prepare('SELECT 1 FROM urls WHERE code = ?');
         $stmt->execute([$code]);
     } while ($stmt->fetchColumn());
     return $code;
-}
-
-function isValidUrl(string $url): bool {
-    return filter_var($url, FILTER_VALIDATE_URL) !== false
-        && preg_match('/^https?:\/\//i', $url) === 1;
 }
 
 function lookupCode(PDO $db, string $code): ?string {
@@ -54,13 +168,13 @@ function lookupCode(PDO $db, string $code): ?string {
 }
 
 function storeUrl(PDO $db, string $url): string {
-    // Return existing code if URL was already shortened
     $stmt = $db->prepare('SELECT code FROM urls WHERE url = ?');
     $stmt->execute([$url]);
     $row = $stmt->fetch(PDO::FETCH_ASSOC);
     if ($row) {
         return $row['code'];
     }
+
     $code = generateCode($db);
     $db->prepare('INSERT INTO urls (code, url, created) VALUES (?, ?, ?)')
        ->execute([$code, $url, time()]);
@@ -68,54 +182,82 @@ function storeUrl(PDO $db, string $url): string {
 }
 
 // ---------------------------------------------------------------------------
+// Safe redirect — strips header-injection characters before sending Location
+// ---------------------------------------------------------------------------
+
+function safeRedirect(string $url): void {
+    $url = str_replace(["\r", "\n", "\0"], '', $url);
+    header('Location: ' . $url, true, 301);
+    exit;
+}
+
+// ---------------------------------------------------------------------------
 // Request routing
 // ---------------------------------------------------------------------------
 
-$code = trim($_GET['code'] ?? '');
+$clientIp = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+$code     = trim($_GET['code'] ?? '');
+$shortUrl = null;
+$newCode  = null;
+$error    = null;
+$notFound = false;
 
-// Redirect if a short code was requested
-if ($code !== '') {
-    $db  = getDb();
-    $url = lookupCode($db, $code);
-    if ($url !== null) {
-        header('Location: ' . $url, true, 301);
-        exit;
-    }
-    // Invalid code — fall through to show the page with an error
-    $notFound = true;
-}
-
-$shortUrl   = null;
-$error      = null;
-
-// Handle form submission / JSON API
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $isJson = str_contains($_SERVER['HTTP_ACCEPT'] ?? '', 'application/json')
-           || str_contains($_SERVER['CONTENT_TYPE'] ?? '', 'application/json');
-
-    $body    = $isJson ? json_decode(file_get_contents('php://input'), true) : null;
-    $longUrl = trim($body['url'] ?? $_POST['url'] ?? '');
-
-    if ($longUrl === '') {
-        $error = 'Please enter a URL.';
-    } elseif (!isValidUrl($longUrl)) {
-        $error = 'Please enter a valid URL starting with http:// or https://';
-    } else {
-        $db      = getDb();
-        $newCode = storeUrl($db, $longUrl);
-        $shortUrl = BASE_URL . $newCode;
-    }
-
-    if ($isJson) {
-        header('Content-Type: application/json');
-        if ($error) {
-            echo json_encode(['error' => $error]);
-        } else {
-            echo json_encode(['short_url' => $shortUrl, 'code' => $newCode]);
+try {
+    if ($code !== '') {
+        $db  = getDb();
+        $url = lookupCode($db, $code);
+        if ($url !== null) {
+            safeRedirect($url);
         }
-        exit;
+        $notFound = true;
     }
+
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        $isJson = str_contains($_SERVER['HTTP_ACCEPT'] ?? '', 'application/json')
+               || str_contains($_SERVER['CONTENT_TYPE'] ?? '', 'application/json');
+
+        if ($isJson) {
+            $body    = json_decode((string) file_get_contents('php://input'), true) ?? [];
+            $longUrl = trim((string) ($body['url'] ?? ''));
+            $csrf    = (string) ($body['csrf_token'] ?? '');
+        } else {
+            $longUrl = trim((string) ($_POST['url'] ?? ''));
+            $csrf    = (string) ($_POST['csrf_token'] ?? '');
+        }
+
+        if (!verifyCsrf($csrf)) {
+            $error = 'Invalid request. Please refresh the page and try again.';
+        } elseif ($longUrl === '') {
+            $error = 'Please enter a URL.';
+        } elseif (strlen($longUrl) > MAX_URL_LEN) {
+            $error = 'URL is too long (max ' . MAX_URL_LEN . ' characters).';
+        } elseif (!isValidUrl($longUrl)) {
+            $error = 'Please enter a valid URL starting with http:// or https://';
+        } else {
+            $db = getDb();
+            if (!checkRateLimit($db, $clientIp)) {
+                $error = 'Too many requests. Please wait a moment and try again.';
+            } else {
+                recordRequest($db, $clientIp);
+                $newCode  = storeUrl($db, $longUrl);
+                $shortUrl = BASE_URL . $newCode;
+            }
+        }
+
+        if ($isJson) {
+            header('Content-Type: application/json');
+            echo $error
+                ? json_encode(['error' => $error])
+                : json_encode(['short_url' => $shortUrl, 'code' => $newCode]);
+            exit;
+        }
+    }
+} catch (Throwable $e) {
+    error_log('URL shortener error: ' . $e->getMessage());
+    $error = 'A server error occurred. Please try again later.';
 }
+
+$csrfToken = getCsrfToken();
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -165,28 +307,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             font-size: 18px;
         }
 
-        .logo-text {
-            font-size: 1.2rem;
-            font-weight: 700;
-            color: #fff;
-        }
+        .logo-text { font-size: 1.2rem; font-weight: 700; color: #fff; }
+        .logo-text span { color: #6c63ff; }
 
-        .logo-text span {
-            color: #6c63ff;
-        }
+        h1 { font-size: 1.6rem; font-weight: 700; color: #fff; margin-bottom: .5rem; }
 
-        h1 {
-            font-size: 1.6rem;
-            font-weight: 700;
-            color: #fff;
-            margin-bottom: .5rem;
-        }
-
-        .subtitle {
-            color: #888;
-            font-size: .95rem;
-            margin-bottom: 2rem;
-        }
+        .subtitle { color: #888; font-size: .95rem; margin-bottom: 2rem; }
 
         label {
             display: block;
@@ -198,10 +324,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             text-transform: uppercase;
         }
 
-        .input-row {
-            display: flex;
-            gap: .5rem;
-        }
+        .input-row { display: flex; gap: .5rem; }
 
         input[type="url"] {
             flex: 1;
@@ -215,10 +338,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             transition: border-color .2s;
         }
 
-        input[type="url"]:focus {
-            border-color: #6c63ff;
-        }
-
+        input[type="url"]:focus { border-color: #6c63ff; }
         input[type="url"]::placeholder { color: #444; }
 
         button[type="submit"] {
@@ -264,11 +384,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             margin-bottom: .6rem;
         }
 
-        .result-row {
-            display: flex;
-            align-items: center;
-            gap: .5rem;
-        }
+        .result-row { display: flex; align-items: center; gap: .5rem; }
 
         .short-url {
             flex: 1;
@@ -307,13 +423,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             padding: .75rem 1rem;
         }
 
-        .footer {
-            margin-top: 2rem;
-            text-align: center;
-            font-size: .8rem;
-            color: #444;
-        }
-
+        .footer { margin-top: 2rem; text-align: center; font-size: .8rem; color: #444; }
         .footer a { color: #6c63ff; text-decoration: none; }
         .footer a:hover { text-decoration: underline; }
     </style>
@@ -329,6 +439,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     <p class="subtitle">Paste any long link and get a short, shareable URL.</p>
 
     <form method="POST" action="/link/" id="shorten-form">
+        <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrfToken, ENT_QUOTES) ?>">
         <label for="url-input">Your long URL</label>
         <div class="input-row">
             <input
@@ -337,6 +448,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 name="url"
                 placeholder="https://example.com/very/long/url..."
                 value="<?= htmlspecialchars($_POST['url'] ?? '', ENT_QUOTES) ?>"
+                maxlength="<?= MAX_URL_LEN ?>"
                 required
                 autofocus
             >
@@ -344,7 +456,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         </div>
     </form>
 
-    <?php if (isset($notFound)): ?>
+    <?php if ($notFound): ?>
         <div class="not-found">
             Short link <strong><?= htmlspecialchars($code, ENT_QUOTES) ?></strong> was not found.
         </div>
