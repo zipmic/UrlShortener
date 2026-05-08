@@ -1,0 +1,11 @@
+Options -Indexes
+
+RewriteEngine On
+RewriteBase /link/
+
+# Skip existing files and directories
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+
+# Route short codes to index.php
+RewriteRule ^([a-zA-Z0-9_-]+)$ index.php?code=$1 [L,QSA]
