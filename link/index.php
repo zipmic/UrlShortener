@@ -103,9 +103,17 @@ function getDb(): PDO {
     $db->exec("CREATE TABLE IF NOT EXISTS urls (
         code    TEXT PRIMARY KEY,
         url     TEXT NOT NULL,
-        created INTEGER NOT NULL
+        created INTEGER NOT NULL,
+        clicks  INTEGER NOT NULL DEFAULT 0
     )");
     $db->exec("CREATE INDEX IF NOT EXISTS idx_urls_url ON urls(url)");
+
+    // Migration: add clicks column to existing installs
+    try {
+        $db->exec("ALTER TABLE urls ADD COLUMN clicks INTEGER NOT NULL DEFAULT 0");
+    } catch (PDOException) {
+        // Column already exists — ignore
+    }
 
     $db->exec("CREATE TABLE IF NOT EXISTS rate_limits (
         ip  TEXT    NOT NULL,
@@ -296,6 +304,7 @@ if ($code !== '') {
     try {
         $url = lookupCode($code);
         if ($url !== null) {
+            getDb()->prepare('UPDATE urls SET clicks = clicks + 1 WHERE code = ?')->execute([$code]);
             safeRedirect($url, 302); // exits here on success
         }
     } catch (Throwable $e) {
