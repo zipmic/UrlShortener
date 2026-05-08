@@ -19,6 +19,7 @@ if (PHP_VERSION_ID < 80000) {
 // Example for typical shared hosting:
 //   define('DB_PATH', dirname(__DIR__, 2) . '/urlshortener_data/urls.db');
 define('DB_PATH',           __DIR__ . '/data/urls.db');
+define('LOG_PATH',          __DIR__ . '/data/app.log');
 define('BASE_URL',          'https://www.code.dk/link/');
 define('CODE_LEN',          6);
 define('MAX_URL_LEN',       2048);
@@ -37,42 +38,29 @@ const BLOCKED_DOMAINS = [
 ];
 
 // ---------------------------------------------------------------------------
+// CSP nonce — generated once per request for inline style + script
+// ---------------------------------------------------------------------------
+
+$cspNonce = base64_encode(random_bytes(16));
+
+// ---------------------------------------------------------------------------
 // Security headers
 // ---------------------------------------------------------------------------
 
 header('X-Content-Type-Options: nosniff');
 header('X-Frame-Options: DENY');
 header('Referrer-Policy: no-referrer');
-header("Content-Security-Policy: default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'");
+header("Content-Security-Policy: default-src 'self'; style-src 'nonce-{$cspNonce}'; script-src 'nonce-{$cspNonce}'");
 header('Strict-Transport-Security: max-age=31536000; includeSubDomains');
 
 // ---------------------------------------------------------------------------
-// Session — hardened cookie params must be set before session_start()
+// Logging — writes to a local file you can read via FTP, falls back to error_log
 // ---------------------------------------------------------------------------
 
-session_set_cookie_params([
-    'lifetime' => 0,
-    'path'     => '/',
-    'secure'   => true,
-    'httponly' => true,
-    'samesite' => 'Strict',
-]);
-session_start();
-
-// ---------------------------------------------------------------------------
-// CSRF
-// ---------------------------------------------------------------------------
-
-function getCsrfToken(): string {
-    if (empty($_SESSION['csrf_token'])) {
-        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
-    }
-    return $_SESSION['csrf_token'];
-}
-
-function verifyCsrf(string $token): bool {
-    return !empty($_SESSION['csrf_token'])
-        && hash_equals($_SESSION['csrf_token'], $token);
+function logError(string $message): void {
+    $line = '[' . date('Y-m-d H:i:s') . '] ' . $message . PHP_EOL;
+    @file_put_contents(LOG_PATH, $line, FILE_APPEND | LOCK_EX);
+    error_log($message);
 }
 
 // ---------------------------------------------------------------------------
@@ -84,7 +72,6 @@ function getClientIp(): string {
 
     if (TRUSTED_PROXIES !== [] && in_array($remoteAddr, TRUSTED_PROXIES, true)) {
         $forwarded = $_SERVER['HTTP_X_FORWARDED_FOR'] ?? '';
-        // X-Forwarded-For can be a comma-separated list; the first entry is the real client
         $ip = trim(explode(',', $forwarded)[0]);
         if (filter_var($ip, FILTER_VALIDATE_IP) !== false) {
             return $ip;
@@ -95,10 +82,15 @@ function getClientIp(): string {
 }
 
 // ---------------------------------------------------------------------------
-// Database
+// Database — singleton per request
 // ---------------------------------------------------------------------------
 
 function getDb(): PDO {
+    static $db = null;
+    if ($db !== null) {
+        return $db;
+    }
+
     $dir = dirname(DB_PATH);
     if (!is_dir($dir) && !mkdir($dir, 0750, true) && !is_dir($dir)) {
         throw new RuntimeException('Cannot create data directory: ' . $dir);
@@ -106,8 +98,6 @@ function getDb(): PDO {
 
     $db = new PDO('sqlite:' . DB_PATH);
     $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-
-    // WAL mode reduces write-lock contention under concurrent traffic
     $db->exec("PRAGMA journal_mode=WAL");
 
     $db->exec("CREATE TABLE IF NOT EXISTS urls (
@@ -115,34 +105,67 @@ function getDb(): PDO {
         url     TEXT NOT NULL,
         created INTEGER NOT NULL
     )");
-
-    // Index on url speeds up the deduplication lookup in storeUrl()
     $db->exec("CREATE INDEX IF NOT EXISTS idx_urls_url ON urls(url)");
 
     $db->exec("CREATE TABLE IF NOT EXISTS rate_limits (
         ip  TEXT    NOT NULL,
         ts  INTEGER NOT NULL
     )");
-
     $db->exec("CREATE INDEX IF NOT EXISTS idx_rate ON rate_limits (ip, ts)");
 
+    // Stores auto-generated secrets (e.g. the IP hash salt)
+    $db->exec("CREATE TABLE IF NOT EXISTS config (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    )");
+
     return $db;
+}
+
+// ---------------------------------------------------------------------------
+// IP hashing — salt auto-generated on first run and stored in DB (GDPR-friendly)
+// ---------------------------------------------------------------------------
+
+function getIpSalt(): string {
+    static $salt = null;
+    if ($salt !== null) {
+        return $salt;
+    }
+
+    $db   = getDb();
+    $stmt = $db->prepare('SELECT value FROM config WHERE key = ?');
+    $stmt->execute(['ip_salt']);
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    if ($row) {
+        $salt = $row['value'];
+    } else {
+        $salt = bin2hex(random_bytes(32));
+        $db->prepare("INSERT INTO config (key, value) VALUES ('ip_salt', ?)")->execute([$salt]);
+    }
+
+    return $salt;
+}
+
+function hashIp(string $ip): string {
+    return hash('sha256', getIpSalt() . $ip);
 }
 
 // ---------------------------------------------------------------------------
 // Rate limiting
 // ---------------------------------------------------------------------------
 
-function checkRateLimit(PDO $db, string $ip): bool {
+function checkRateLimit(string $hashedIp): bool {
+    $db    = getDb();
     $since = time() - RATE_LIMIT_WINDOW;
     $db->prepare('DELETE FROM rate_limits WHERE ts < ?')->execute([$since]);
     $stmt = $db->prepare('SELECT COUNT(*) FROM rate_limits WHERE ip = ? AND ts >= ?');
-    $stmt->execute([$ip, $since]);
+    $stmt->execute([$hashedIp, $since]);
     return (int) $stmt->fetchColumn() < RATE_LIMIT_MAX;
 }
 
-function recordRequest(PDO $db, string $ip): void {
-    $db->prepare('INSERT INTO rate_limits (ip, ts) VALUES (?, ?)')->execute([$ip, time()]);
+function recordRequest(string $hashedIp): void {
+    getDb()->prepare('INSERT INTO rate_limits (ip, ts) VALUES (?, ?)')->execute([$hashedIp, time()]);
 }
 
 // ---------------------------------------------------------------------------
@@ -150,7 +173,8 @@ function recordRequest(PDO $db, string $ip): void {
 // ---------------------------------------------------------------------------
 
 function isValidUrl(string $url): bool {
-    if (strlen($url) > MAX_URL_LEN) {
+    // mb_strlen counts characters (consistent with browser maxlength attribute)
+    if (mb_strlen($url, 'UTF-8') > MAX_URL_LEN) {
         return false;
     }
     if (!preg_match('/^https?:\/\//i', $url)) {
@@ -171,7 +195,6 @@ function isValidUrl(string $url): bool {
         }
     }
 
-    // Block private / loopback / reserved IP addresses
     if (filter_var($host, FILTER_VALIDATE_IP) !== false) {
         if (!filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
             return false;
@@ -185,7 +208,8 @@ function isValidUrl(string $url): bool {
 // URL storage helpers
 // ---------------------------------------------------------------------------
 
-function generateCode(PDO $db): string {
+function generateCode(): string {
+    $db    = getDb();
     $chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
     do {
         $code = '';
@@ -198,28 +222,41 @@ function generateCode(PDO $db): string {
     return $code;
 }
 
-function lookupCode(PDO $db, string $code): ?string {
-    $stmt = $db->prepare('SELECT url FROM urls WHERE code = ?');
+function lookupCode(string $code): ?string {
+    $stmt = getDb()->prepare('SELECT url FROM urls WHERE code = ?');
     $stmt->execute([$code]);
     $row = $stmt->fetch(PDO::FETCH_ASSOC);
     return $row ? $row['url'] : null;
 }
 
-function storeUrl(PDO $db, string $url): string {
+function storeUrl(string $url): string {
+    $db   = getDb();
     $stmt = $db->prepare('SELECT code FROM urls WHERE url = ?');
     $stmt->execute([$url]);
     $row = $stmt->fetch(PDO::FETCH_ASSOC);
     if ($row) {
         return $row['code'];
     }
-    $code = generateCode($db);
-    $db->prepare('INSERT INTO urls (code, url, created) VALUES (?, ?, ?)')
-       ->execute([$code, $url, time()]);
-    return $code;
+
+    // Retry on the rare concurrent UNIQUE-constraint collision
+    for ($attempt = 0; $attempt < 5; $attempt++) {
+        $code = generateCode();
+        try {
+            $db->prepare('INSERT INTO urls (code, url, created) VALUES (?, ?, ?)')
+               ->execute([$code, $url, time()]);
+            return $code;
+        } catch (PDOException $e) {
+            if (!str_contains($e->getMessage(), 'UNIQUE constraint failed')) {
+                throw $e;
+            }
+        }
+    }
+
+    throw new RuntimeException('Failed to generate a unique code after 5 attempts');
 }
 
 // ---------------------------------------------------------------------------
-// Safe redirect — strips header-injection characters before sending Location
+// Safe redirect
 // ---------------------------------------------------------------------------
 
 function safeRedirect(string $url, int $status = 302): void {
@@ -229,78 +266,106 @@ function safeRedirect(string $url, int $status = 302): void {
 }
 
 // ---------------------------------------------------------------------------
+// CSRF
+// ---------------------------------------------------------------------------
+
+function getCsrfToken(): string {
+    if (empty($_SESSION['csrf_token'])) {
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    }
+    return $_SESSION['csrf_token'];
+}
+
+function verifyCsrf(string $token): bool {
+    return !empty($_SESSION['csrf_token'])
+        && hash_equals($_SESSION['csrf_token'], $token);
+}
+
+// ---------------------------------------------------------------------------
 // Request routing
 // ---------------------------------------------------------------------------
 
-$clientIp = getClientIp();
 $code     = trim($_GET['code'] ?? '');
-$shortUrl = null;
-$error    = null;
 $notFound = false;
+$error    = null;
+$shortUrl = null;
 
-try {
-    // Redirect short codes — 302 so browsers don't cache the destination
-    if ($code !== '') {
-        $db  = getDb();
-        $url = lookupCode($db, $code);
+// Redirect path — attempt lookup before starting a session so bots and
+// crawlers hitting short links never incur session-file overhead
+if ($code !== '') {
+    try {
+        $url = lookupCode($code);
         if ($url !== null) {
-            safeRedirect($url, 302);
+            safeRedirect($url, 302); // exits here on success
         }
-        $notFound = true;
+    } catch (Throwable $e) {
+        logError('Lookup error: ' . $e->getMessage());
+    }
+    $notFound = true;
+}
+
+// Session is only needed from this point on (form render + POST handling)
+session_set_cookie_params([
+    'lifetime' => 0,
+    'path'     => '/',
+    'secure'   => true,
+    'httponly' => true,
+    'samesite' => 'Strict',
+]);
+session_start();
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    // Detect JSON API callers by Content-Type only (not Accept) to avoid
+    // accidentally returning JSON to browsers that send Accept: application/json
+    $isJson = str_contains($_SERVER['CONTENT_TYPE'] ?? '', 'application/json');
+
+    if ($isJson) {
+        $body    = json_decode((string) file_get_contents('php://input'), true) ?? [];
+        $longUrl = trim((string) ($body['url'] ?? ''));
+        $csrf    = (string) ($body['csrf_token'] ?? '');
+    } else {
+        $longUrl = trim((string) ($_POST['url'] ?? ''));
+        $csrf    = (string) ($_POST['csrf_token'] ?? '');
     }
 
-    // POST — shorten a URL
-    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-        $isJson = str_contains($_SERVER['HTTP_ACCEPT'] ?? '', 'application/json')
-               || str_contains($_SERVER['CONTENT_TYPE'] ?? '', 'application/json');
-
-        if ($isJson) {
-            $body    = json_decode((string) file_get_contents('php://input'), true) ?? [];
-            $longUrl = trim((string) ($body['url'] ?? ''));
-            $csrf    = (string) ($body['csrf_token'] ?? '');
-        } else {
-            $longUrl = trim((string) ($_POST['url'] ?? ''));
-            $csrf    = (string) ($_POST['csrf_token'] ?? '');
-        }
-
+    try {
         if (!verifyCsrf($csrf)) {
             $error = 'Invalid request. Please refresh the page and try again.';
         } elseif ($longUrl === '') {
             $error = 'Please enter a URL.';
-        } elseif (strlen($longUrl) > MAX_URL_LEN) {
+        } elseif (mb_strlen($longUrl, 'UTF-8') > MAX_URL_LEN) {
             $error = 'URL is too long (max ' . MAX_URL_LEN . ' characters).';
         } elseif (!isValidUrl($longUrl)) {
             $error = 'Please enter a valid URL starting with http:// or https://';
         } else {
-            $db = getDb();
-            if (!checkRateLimit($db, $clientIp)) {
+            $hashedIp = hashIp(getClientIp());
+            if (!checkRateLimit($hashedIp)) {
                 $error = 'Too many requests. Please wait a moment and try again.';
             } else {
-                recordRequest($db, $clientIp);
-                $newCode  = storeUrl($db, $longUrl);
+                recordRequest($hashedIp);
+                $newCode  = storeUrl($longUrl);
                 $shortUrl = BASE_URL . $newCode;
             }
         }
-
-        if ($isJson) {
-            header('Content-Type: application/json');
-            echo json_encode(
-                $error ? ['error' => $error] : ['short_url' => $shortUrl, 'code' => $newCode],
-                JSON_THROW_ON_ERROR
-            );
-            exit;
-        }
-
-        // POST-Redirect-GET: store result in session and redirect to avoid resubmit on F5
-        if (!$error) {
-            $_SESSION['flash_short_url'] = $shortUrl;
-            safeRedirect('/link/');
-        }
-        // On error fall through to re-render the form with the error message
+    } catch (Throwable $e) {
+        logError('Shorten error: ' . $e->getMessage());
+        $error = 'A server error occurred. Please try again later.';
     }
-} catch (Throwable $e) {
-    error_log('URL shortener error: ' . $e->getMessage());
-    $error = 'A server error occurred. Please try again later.';
+
+    if ($isJson) {
+        header('Content-Type: application/json');
+        echo json_encode(
+            $error ? ['error' => $error] : ['short_url' => $shortUrl, 'code' => $newCode],
+            JSON_THROW_ON_ERROR
+        );
+        exit;
+    }
+
+    // POST-Redirect-GET: flash result and redirect to prevent F5 resubmit
+    if (!$error) {
+        $_SESSION['flash_short_url'] = $shortUrl;
+        safeRedirect('/link/');
+    }
 }
 
 // Pick up a flashed short URL from a previous POST-redirect
@@ -317,7 +382,7 @@ $csrfToken = getCsrfToken();
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>URL Shortener — code.dk</title>
-    <style>
+    <style nonce="<?= htmlspecialchars($cspNonce, ENT_QUOTES) ?>">
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
         body {
@@ -489,7 +554,7 @@ $csrfToken = getCsrfToken();
     <h1>Shorten a URL</h1>
     <p class="subtitle">Paste any long link and get a short, shareable URL.</p>
 
-    <form method="POST" action="/link/" id="shorten-form">
+    <form method="POST" action="" id="shorten-form">
         <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrfToken, ENT_QUOTES) ?>">
         <label for="url-input">Your long URL</label>
         <div class="input-row">
@@ -531,7 +596,7 @@ $csrfToken = getCsrfToken();
     </div>
 </div>
 
-<script>
+<script nonce="<?= htmlspecialchars($cspNonce, ENT_QUOTES) ?>">
 (function () {
     const btn = document.getElementById('copy-btn');
     if (!btn) return;

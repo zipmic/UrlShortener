@@ -1,0 +1,7 @@
+{
+    "name": "zipmic/urlshortener",
+    "description": "Simple PHP URL shortener with SQLite storage",
+    "require": {
+        "php": ">=8.0"
+    }
+}
