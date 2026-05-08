@@ -2,6 +2,15 @@
 declare(strict_types=1);
 
 // ---------------------------------------------------------------------------
+// PHP version guard
+// ---------------------------------------------------------------------------
+
+if (PHP_VERSION_ID < 80000) {
+    http_response_code(500);
+    exit('This application requires PHP 8.0 or later. Current version: ' . PHP_VERSION);
+}
+
+// ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
@@ -9,12 +18,18 @@ declare(strict_types=1);
 // change this to an absolute path above your public_html / www directory.
 // Example for typical shared hosting:
 //   define('DB_PATH', dirname(__DIR__, 2) . '/urlshortener_data/urls.db');
-define('DB_PATH',            __DIR__ . '/data/urls.db');
-define('BASE_URL',           'https://www.code.dk/link/');
-define('CODE_LEN',           6);
-define('MAX_URL_LEN',        2048);
-define('RATE_LIMIT_MAX',     10);   // max submissions per IP per window
-define('RATE_LIMIT_WINDOW',  60);   // seconds
+define('DB_PATH',           __DIR__ . '/data/urls.db');
+define('BASE_URL',          'https://www.code.dk/link/');
+define('CODE_LEN',          6);
+define('MAX_URL_LEN',       2048);
+define('RATE_LIMIT_MAX',    10);   // max submissions per IP per window
+define('RATE_LIMIT_WINDOW', 60);   // seconds
+
+// If your site runs behind Cloudflare or a reverse proxy, add the proxy's
+// IP address(es) here so the real visitor IP is read from X-Forwarded-For.
+// Cloudflare's full IP list: https://www.cloudflare.com/ips/
+// Example: ['103.21.244.0', '103.22.200.0', ...]
+const TRUSTED_PROXIES = [];
 
 const BLOCKED_DOMAINS = [
     'localhost',
@@ -29,12 +44,24 @@ header('X-Content-Type-Options: nosniff');
 header('X-Frame-Options: DENY');
 header('Referrer-Policy: no-referrer');
 header("Content-Security-Policy: default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'");
+header('Strict-Transport-Security: max-age=31536000; includeSubDomains');
 
 // ---------------------------------------------------------------------------
-// Session + CSRF
+// Session — hardened cookie params must be set before session_start()
 // ---------------------------------------------------------------------------
 
+session_set_cookie_params([
+    'lifetime' => 0,
+    'path'     => '/',
+    'secure'   => true,
+    'httponly' => true,
+    'samesite' => 'Strict',
+]);
 session_start();
+
+// ---------------------------------------------------------------------------
+// CSRF
+// ---------------------------------------------------------------------------
 
 function getCsrfToken(): string {
     if (empty($_SESSION['csrf_token'])) {
@@ -46,6 +73,25 @@ function getCsrfToken(): string {
 function verifyCsrf(string $token): bool {
     return !empty($_SESSION['csrf_token'])
         && hash_equals($_SESSION['csrf_token'], $token);
+}
+
+// ---------------------------------------------------------------------------
+// Client IP — respects trusted proxy X-Forwarded-For
+// ---------------------------------------------------------------------------
+
+function getClientIp(): string {
+    $remoteAddr = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+
+    if (TRUSTED_PROXIES !== [] && in_array($remoteAddr, TRUSTED_PROXIES, true)) {
+        $forwarded = $_SERVER['HTTP_X_FORWARDED_FOR'] ?? '';
+        // X-Forwarded-For can be a comma-separated list; the first entry is the real client
+        $ip = trim(explode(',', $forwarded)[0]);
+        if (filter_var($ip, FILTER_VALIDATE_IP) !== false) {
+            return $ip;
+        }
+    }
+
+    return $remoteAddr;
 }
 
 // ---------------------------------------------------------------------------
@@ -70,6 +116,9 @@ function getDb(): PDO {
         created INTEGER NOT NULL
     )");
 
+    // Index on url speeds up the deduplication lookup in storeUrl()
+    $db->exec("CREATE INDEX IF NOT EXISTS idx_urls_url ON urls(url)");
+
     $db->exec("CREATE TABLE IF NOT EXISTS rate_limits (
         ip  TEXT    NOT NULL,
         ts  INTEGER NOT NULL
@@ -86,10 +135,7 @@ function getDb(): PDO {
 
 function checkRateLimit(PDO $db, string $ip): bool {
     $since = time() - RATE_LIMIT_WINDOW;
-
-    // Prune expired entries to keep the table small
     $db->prepare('DELETE FROM rate_limits WHERE ts < ?')->execute([$since]);
-
     $stmt = $db->prepare('SELECT COUNT(*) FROM rate_limits WHERE ip = ? AND ts >= ?');
     $stmt->execute([$ip, $since]);
     return (int) $stmt->fetchColumn() < RATE_LIMIT_MAX;
@@ -107,11 +153,9 @@ function isValidUrl(string $url): bool {
     if (strlen($url) > MAX_URL_LEN) {
         return false;
     }
-
     if (!preg_match('/^https?:\/\//i', $url)) {
         return false;
     }
-
     if (filter_var($url, FILTER_VALIDATE_URL) === false) {
         return false;
     }
@@ -121,7 +165,6 @@ function isValidUrl(string $url): bool {
         return false;
     }
 
-    // Block explicitly listed domains
     foreach (BLOCKED_DOMAINS as $blocked) {
         if ($host === $blocked || str_ends_with($host, '.' . $blocked)) {
             return false;
@@ -130,12 +173,7 @@ function isValidUrl(string $url): bool {
 
     // Block private / loopback / reserved IP addresses
     if (filter_var($host, FILTER_VALIDATE_IP) !== false) {
-        $isPublic = filter_var(
-            $host,
-            FILTER_VALIDATE_IP,
-            FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE
-        );
-        if ($isPublic === false) {
+        if (!filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
             return false;
         }
     }
@@ -174,7 +212,6 @@ function storeUrl(PDO $db, string $url): string {
     if ($row) {
         return $row['code'];
     }
-
     $code = generateCode($db);
     $db->prepare('INSERT INTO urls (code, url, created) VALUES (?, ?, ?)')
        ->execute([$code, $url, time()]);
@@ -185,9 +222,9 @@ function storeUrl(PDO $db, string $url): string {
 // Safe redirect — strips header-injection characters before sending Location
 // ---------------------------------------------------------------------------
 
-function safeRedirect(string $url): void {
+function safeRedirect(string $url, int $status = 302): void {
     $url = str_replace(["\r", "\n", "\0"], '', $url);
-    header('Location: ' . $url, true, 301);
+    header('Location: ' . $url, true, $status);
     exit;
 }
 
@@ -195,23 +232,24 @@ function safeRedirect(string $url): void {
 // Request routing
 // ---------------------------------------------------------------------------
 
-$clientIp = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+$clientIp = getClientIp();
 $code     = trim($_GET['code'] ?? '');
 $shortUrl = null;
-$newCode  = null;
 $error    = null;
 $notFound = false;
 
 try {
+    // Redirect short codes — 302 so browsers don't cache the destination
     if ($code !== '') {
         $db  = getDb();
         $url = lookupCode($db, $code);
         if ($url !== null) {
-            safeRedirect($url);
+            safeRedirect($url, 302);
         }
         $notFound = true;
     }
 
+    // POST — shorten a URL
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $isJson = str_contains($_SERVER['HTTP_ACCEPT'] ?? '', 'application/json')
                || str_contains($_SERVER['CONTENT_TYPE'] ?? '', 'application/json');
@@ -246,15 +284,29 @@ try {
 
         if ($isJson) {
             header('Content-Type: application/json');
-            echo $error
-                ? json_encode(['error' => $error])
-                : json_encode(['short_url' => $shortUrl, 'code' => $newCode]);
+            echo json_encode(
+                $error ? ['error' => $error] : ['short_url' => $shortUrl, 'code' => $newCode],
+                JSON_THROW_ON_ERROR
+            );
             exit;
         }
+
+        // POST-Redirect-GET: store result in session and redirect to avoid resubmit on F5
+        if (!$error) {
+            $_SESSION['flash_short_url'] = $shortUrl;
+            safeRedirect('/link/');
+        }
+        // On error fall through to re-render the form with the error message
     }
 } catch (Throwable $e) {
     error_log('URL shortener error: ' . $e->getMessage());
     $error = 'A server error occurred. Please try again later.';
+}
+
+// Pick up a flashed short URL from a previous POST-redirect
+if (isset($_SESSION['flash_short_url'])) {
+    $shortUrl = $_SESSION['flash_short_url'];
+    unset($_SESSION['flash_short_url']);
 }
 
 $csrfToken = getCsrfToken();
@@ -311,7 +363,6 @@ $csrfToken = getCsrfToken();
         .logo-text span { color: #6c63ff; }
 
         h1 { font-size: 1.6rem; font-weight: 700; color: #fff; margin-bottom: .5rem; }
-
         .subtitle { color: #888; font-size: .95rem; margin-bottom: 2rem; }
 
         label {
@@ -447,7 +498,6 @@ $csrfToken = getCsrfToken();
                 id="url-input"
                 name="url"
                 placeholder="https://example.com/very/long/url..."
-                value="<?= htmlspecialchars($_POST['url'] ?? '', ENT_QUOTES) ?>"
                 maxlength="<?= MAX_URL_LEN ?>"
                 required
                 autofocus
